@@ -1,9 +1,35 @@
 import axios from 'axios'
 
-const API_URL =
+const normalizeApiBaseUrl = (rawUrl) => {
+  if (!rawUrl) return rawUrl
+
+  const url = String(rawUrl).trim()
+
+  if (url.startsWith('ttps://')) {
+    console.warn(
+      '[api] VITE_API_BASE_URL looks malformed (missing leading "h"). Auto-fixing.'
+    )
+    return `h${url}`
+  }
+
+  if (/^https?:\/\//i.test(url)) return url
+
+  // Allow relative API base for dev/proxy setups.
+  if (url.startsWith('/')) return url
+
+  // Protocol-relative URL.
+  if (url.startsWith('//')) return `${window.location.protocol}${url}`
+
+  // If user supplied a host without protocol, assume http for localhost and https otherwise.
+  const isLocalhost = /^(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(url)
+  return `${isLocalhost ? 'http' : 'https'}://${url}`
+}
+
+const API_URL = normalizeApiBaseUrl(
   import.meta.env.VITE_API_BASE_URL ||
-  import.meta.env.VITE_API_URL ||
-  '/api/v1'
+    import.meta.env.VITE_API_URL ||
+    '/api/v1'
+)
 
 const api = axios.create({
   baseURL: API_URL,

@@ -76,7 +76,15 @@ def _mock_student_profile(email: str) -> Dict[str, Any]:
 
 def _headers() -> Dict[str, str]:
     api_key = getattr(settings, 'PBL_API_KEY', '')
-    return {'x-api-key': api_key} if api_key else {}
+    if not api_key:
+        return {}
+
+    # Some PBL deployments use `x-api-key`, others use `Authorization: Bearer`.
+    # Sending both is usually safe and prevents 401s when the auth scheme differs.
+    return {
+        'x-api-key': api_key,
+        'Authorization': f'Bearer {api_key}',
+    }
 
 
 def _base_url() -> str:
@@ -92,7 +100,23 @@ def _get_json(path: str, *, params: Optional[Dict[str, Any]] = None, timeout: in
     try:
         resp = requests.get(f"{base}{path}", headers=_headers(), params=params or {}, timeout=timeout)
         if resp.status_code != 200:
-            logger.warning('PBL external API request failed: %s %s', resp.status_code, path)
+            body_preview = (resp.text or '').strip().replace('\n', ' ')
+            if len(body_preview) > 300:
+                body_preview = f"{body_preview[:300]}..."
+            if resp.status_code in (401, 403):
+                logger.error(
+                    'PBL external API unauthorized: %s %s. Body: %s',
+                    resp.status_code,
+                    path,
+                    body_preview,
+                )
+            else:
+                logger.warning(
+                    'PBL external API request failed: %s %s. Body: %s',
+                    resp.status_code,
+                    path,
+                    body_preview,
+                )
             return None
         return resp.json()
     except requests.RequestException as exc:

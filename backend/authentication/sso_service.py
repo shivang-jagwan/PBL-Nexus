@@ -37,6 +37,42 @@ class SSOService:
             return self._mock_verify(sso_token)
         else:
             return self._real_verify(sso_token)
+
+    def _normalize_role(self, raw_user: Dict[str, Any]) -> Optional[str]:
+        """Map partner role payloads to our internal roles.
+
+        We only support 'student' and 'faculty' internally.
+        Some PBL deployments return role='user' for students.
+        """
+        raw_role = (raw_user.get('role') or raw_user.get('type') or '').strip().lower()
+
+        # Explicit faculty/mentor flags take priority.
+        for key in ('is_faculty', 'isFaculty', 'is_teacher', 'isTeacher', 'is_mentor', 'isMentor'):
+            val = raw_user.get(key)
+            if val is True:
+                return 'faculty'
+
+        if raw_role in {'faculty', 'teacher', 'mentor', 'staff'}:
+            return 'faculty'
+        if raw_role in {'student', 'learner', 'user'}:
+            return 'student'
+        if not raw_role:
+            # If role missing, default safely to student.
+            return 'student'
+
+        return None
+
+    def _pbl_headers(self) -> Dict[str, str]:
+        """Return headers for PBL API requests.
+
+        Some deployments expect `x-api-key`, others expect `Authorization: Bearer`.
+        Sending both is generally safe and avoids env mismatches.
+        """
+        headers: Dict[str, str] = {}
+        if self.pbl_api_key:
+            headers['x-api-key'] = self.pbl_api_key
+            headers['Authorization'] = f"Bearer {self.pbl_api_key}"
+        return headers
     
     def _mock_verify(self, sso_token: str) -> Optional[Dict[str, Any]]:
         """
@@ -102,15 +138,34 @@ class SSOService:
                 return None
 
             base = self.pbl_api_url.rstrip('/')
+            verify_path = getattr(settings, 'PBL_SSO_VERIFY_PATH', '/auth/verify')
+            if not verify_path.startswith('/'):
+                verify_path = f"/{verify_path}"
+
             response = requests.get(
-                f"{base}/auth/verify",
+                f"{base}{verify_path}",
                 params={'token': sso_token},
-                headers={'x-api-key': self.pbl_api_key},
+                headers=self._pbl_headers(),
                 timeout=10,
             )
             
             if response.status_code != 200:
-                logger.warning(f"PBL SSO verification failed: {response.status_code}")
+                # Do not log sensitive params (token). Response body is usually safe and helps debugging.
+                body_preview = (response.text or '').strip().replace('\n', ' ')
+                if len(body_preview) > 300:
+                    body_preview = f"{body_preview[:300]}..."
+                if response.status_code in (401, 403):
+                    logger.error(
+                        'PBL SSO verification unauthorized: %s (check PBL_API_KEY / auth scheme). Body: %s',
+                        response.status_code,
+                        body_preview,
+                    )
+                else:
+                    logger.warning(
+                        'PBL SSO verification failed: %s. Body: %s',
+                        response.status_code,
+                        body_preview,
+                    )
                 return None
             
             data = response.json()
@@ -119,17 +174,20 @@ class SSOService:
                 logger.warning('PBL SSO verification returned invalid')
                 return None
 
-            user_data = data.get('user', {})
+            user_data = data.get('user')
+            if not isinstance(user_data, dict) or not user_data:
+                # Some partners return the user payload at top-level.
+                user_data = data if isinstance(data, dict) else {}
 
-            # Validate required fields
-            required_fields = ['id', 'email', 'role']
+            # Validate required fields (role can be inferred)
+            required_fields = ['id', 'email']
             if not all(field in user_data for field in required_fields):
                 logger.warning('PBL SSO response missing required fields')
                 return None
 
-            # Validate role
-            if user_data['role'] not in ['student', 'faculty']:
-                logger.warning(f"Invalid role from PBL: {user_data['role']}")
+            role = self._normalize_role(user_data)
+            if role not in {'student', 'faculty'}:
+                logger.warning('Invalid role from PBL: %s', user_data.get('role'))
                 return None
 
             # Name is optional in some partner payloads; fall back safely
@@ -139,7 +197,7 @@ class SSOService:
                 'pbl_user_id': str(user_data['id']),
                 'email': user_data['email'],
                 'name': name,
-                'role': user_data['role'],
+                'role': role,
             }
             
         except requests.RequestException as e:
